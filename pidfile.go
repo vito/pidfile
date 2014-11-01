@@ -21,39 +21,79 @@ func (err ProcessExistsError) Error() string {
 }
 
 func (runner *Runner) Run(signals <-chan os.Signal, ready chan<- struct{}) error {
-	err := os.MkdirAll(filepath.Dir(runner.Filename), 0755)
+	// acquire locked pidfile to prevent other processes from trying to start
+	// with the same pidfile (e.g. monit continuously trying to start)
+	pidfile, err := acquirePidfile(runner.Filename)
 	if err != nil {
 		return err
 	}
 
-	pidfile, err := os.OpenFile(runner.Filename, os.O_CREATE|os.O_RDWR, 0666)
+	// check for an existing pid
+	err = checkForExistingPid(pidfile)
 	if err != nil {
 		return err
+	}
+
+	// write the current pid
+	err = writePid(pidfile)
+	if err != nil {
+		return err
+	}
+
+	close(ready)
+
+	<-signals
+
+	return releasePidfile(pidfile)
+}
+
+func acquirePidfile(path string) (*os.File, error) {
+	// ensure parent dir exists
+	err := os.MkdirAll(filepath.Dir(path), 0755)
+	if err != nil {
+		return nil, err
+	}
+
+	pidfile, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0666)
+	if err != nil {
+		return nil, err
 	}
 
 	err = syscall.Flock(int(pidfile.Fd()), syscall.LOCK_NB|syscall.LOCK_EX)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
+	return pidfile, nil
+}
+
+func checkForExistingPid(pidfile *os.File) error {
 	var existingPid int
-	_, err = fmt.Fscanf(pidfile, "%d", &existingPid)
-	if err == nil {
-		process, err := os.FindProcess(existingPid)
-		if err == nil {
-			err := process.Signal(syscall.Signal(0))
-			if err == nil {
-				process.Release()
-
-				return ProcessExistsError{
-					Filename: runner.Filename,
-					Pid:      existingPid,
-				}
-			}
-		}
+	_, err := fmt.Fscanf(pidfile, "%d", &existingPid)
+	if err != nil {
+		return nil
 	}
 
-	err = pidfile.Truncate(0)
+	process, err := os.FindProcess(existingPid)
+	if err != nil {
+		return nil
+	}
+
+	err = process.Signal(syscall.Signal(0))
+	if err != nil {
+		return nil
+	}
+
+	process.Release()
+
+	return ProcessExistsError{
+		Filename: pidfile.Name(),
+		Pid:      existingPid,
+	}
+}
+
+func writePid(pidfile *os.File) error {
+	err := pidfile.Truncate(0)
 	if err != nil {
 		return err
 	}
@@ -63,9 +103,16 @@ func (runner *Runner) Run(signals <-chan os.Signal, ready chan<- struct{}) error
 		return err
 	}
 
-	close(ready)
+	return nil
+}
 
-	<-signals
+func releasePidfile(pidfile *os.File) error {
+	// remove file while locked
+	err := os.Remove(pidfile.Name())
+	if err != nil {
+		return err
+	}
 
-	return os.Remove(runner.Filename)
+	// release flock
+	return pidfile.Close()
 }
